@@ -1,1 +1,1 @@
-# RelayBox
+PathLens is a distributed network diagnostics and monitoring platform that helps developers identify why websites and APIs are slow, unreachable, or failing in different regions. It runs automated DNS, TCP, TLS, and HTTP tests from distributed probes, collects performance metrics, and correlates failures with application telemetry when available. Built to explore API gateways, distributed databases, caching, message queues, load balancing, and network protocols.
