@@ -7,5 +7,7 @@ venv/
 # Editor backup files
 *~
 
+pathlens_history.jsonl
+
 # macOS
 .DS_Store

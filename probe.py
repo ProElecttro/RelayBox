@@ -1,4 +1,6 @@
-
+from datetime import datetime, timezone
+from pathlib import Path
+import uuid
 import argparse
 import ipaddress
 import json
@@ -16,6 +18,18 @@ def make_result(stage, outcome, target, elapsed_ms):
         "target": target,
         "elapsed_ms": round(elapsed_ms, 2),
     }
+
+
+def save_history(report, history_path):
+    """Append one complete probe report as a JSONL record."""
+    path = Path(history_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    with path.open("a", encoding="utf-8") as history_file:
+        history_file.write(
+            json.dumps(report, separators=(",", ":")) + "\n"
+        )
+
 
 
 def classify_http_status(status_code):
@@ -542,6 +556,18 @@ def main():
         help="Connect to a specific IP for the initial URL",
     )
 
+    parser.add_argument(
+        "--history",
+        default="pathlens_history.jsonl",
+        help="File to append probe history to",
+    )
+
+    parser.add_argument(
+        "--no-history",
+        action="store_true",
+        help="Do not save this run to history",
+    )
+
     args = parser.parse_args()
 
     if args.max_redirects < 0:
@@ -611,14 +637,26 @@ def main():
     else:
         application_outcome = classify_http_status(final_status)
 
+
     report = {
+        "run_id": str(uuid.uuid4()),
+        "timestamp": datetime.now(timezone.utc).isoformat(
+            timespec="milliseconds"
+        ).replace("+00:00", "Z"),
         "target": args.hostname,
         "overall_outcome": overall_outcome,
-        "application_outcome": application_outcome,
         "redirects_followed": redirects_followed,
         "hops": hops,
     }
 
+    if not args.no_history:
+        try:
+            save_history(report, args.history)
+        except OSError as error:
+            print(
+                f"PathLens: could not save history: {error}",
+                file=sys.stderr,
+            )
 
     print(json.dumps(report, indent=2))
 
