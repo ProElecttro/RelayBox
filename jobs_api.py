@@ -78,19 +78,24 @@ def request_fingerprint(target, timeout, max_redirects):
 def normalize_status(status):
     return status.value if hasattr(status, "value") else str(status)
 
+def enqueue_probe(target, timeout, max_redirects, job_id=None):
+    options = {
+        "job_timeout": 150,
+        "result_ttl": 86400,
+        "failure_ttl": 604800,
+        "retry": Retry(max=2, interval=[5, 15]),
+    }
 
-def enqueue_probe(target, timeout, max_redirects):
+    if job_id is not None:
+        options["job_id"] = job_id
+
     return queue.enqueue(
         run_probe,
         target,
         timeout,
         max_redirects,
-        job_timeout=150,
-        result_ttl=86400,
-        failure_ttl=604800,
-        retry=Retry(max=2, interval=[5, 15]),
+        **options,
     )
-
 
 @app.get("/health")
 def health():
@@ -102,7 +107,6 @@ def health():
             status_code=503,
             detail="Redis unavailable",
         )
-
 
 @app.post("/probes", status_code=202)
 def submit_probe(
@@ -117,9 +121,7 @@ def submit_probe(
     if idempotency_key is None:
         try:
             job = enqueue_probe(
-                target,
-                request.timeout,
-                request.max_redirects,
+                target, request.timeout, request.max_redirects
             )
             return {
                 "job_id": job.id,
@@ -133,7 +135,6 @@ def submit_probe(
             )
 
     idempotency_key = idempotency_key.strip()
-
     if not idempotency_key or len(idempotency_key) > 200:
         raise HTTPException(
             status_code=400,
@@ -141,24 +142,21 @@ def submit_probe(
         )
 
     fingerprint = request_fingerprint(
-        target,
-        request.timeout,
-        request.max_redirects,
+        target, request.timeout, request.max_redirects
     )
-
     key_hash = hashlib.sha256(
         idempotency_key.encode("utf-8")
     ).hexdigest()
 
+    deterministic_job_id = f"pathlens-{key_hash}"
     redis_key = f"pathlens:idempotency:{key_hash}"
     lock_key = f"pathlens:idempotency-lock:{key_hash}"
 
     try:
         with redis_conn.lock(
-            lock_key,
-            timeout=IDEMPOTENCY_LOCK_TIMEOUT,
-            blocking_timeout=5,
+            lock_key, timeout=IDEMPOTENCY_LOCK_TIMEOUT, blocking_timeout=5
         ):
+            # 1. Check the saved idempotency record.
             existing = redis_conn.get(redis_key)
 
             if existing:
@@ -175,38 +173,68 @@ def submit_probe(
 
                 try:
                     job = Job.fetch(
-                        data["job_id"],
-                        connection=redis_conn,
+                        data["job_id"], connection=redis_conn
                     )
-                    status = normalize_status(
-                        job.get_status(refresh=True)
-                    )
-
                     return {
                         "job_id": job.id,
-                        "status": status,
+                        "status": normalize_status(
+                            job.get_status(refresh=True)
+                        ),
                         "duplicate": True,
                     }
-
                 except NoSuchJobError:
-                    # The RQ job may have expired while the
-                    # idempotency record still exists.
                     redis_conn.delete(redis_key)
 
+            # 2. Recover a job created before its record was saved.
+            existing_job = queue.fetch_job(deterministic_job_id)
+
+            if existing_job is not None:
+                expected_args = (
+                    target,
+                    request.timeout,
+                    request.max_redirects,
+                )
+
+                if tuple(existing_job.args or ()) != expected_args:
+                    raise HTTPException(
+                        status_code=409,
+                        detail=(
+                            "Idempotency-Key was already used "
+                            "for a different request"
+                        ),
+                    )
+
+                redis_conn.set(
+                    redis_key,
+                    json.dumps({
+                        "fingerprint": fingerprint,
+                        "job_id": existing_job.id,
+                    }),
+                    ex=IDEMPOTENCY_TTL,
+                )
+
+                return {
+                    "job_id": existing_job.id,
+                    "status": normalize_status(
+                        existing_job.get_status(refresh=True)
+                    ),
+                    "duplicate": True,
+                }
+
+            # 3. Create a deterministic job and save its record.
             job = enqueue_probe(
                 target,
                 request.timeout,
                 request.max_redirects,
+                job_id=deterministic_job_id,
             )
-
-            record = json.dumps({
-                "fingerprint": fingerprint,
-                "job_id": job.id,
-            })
 
             redis_conn.set(
                 redis_key,
-                record,
+                json.dumps({
+                    "fingerprint": fingerprint,
+                    "job_id": job.id,
+                }),
                 ex=IDEMPOTENCY_TTL,
             )
 

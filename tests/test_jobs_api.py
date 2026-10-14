@@ -62,5 +62,43 @@ class JobsAPITests(unittest.TestCase):
         self.assertEqual(response.status_code, 404)
 
 
+
+    @patch.object(jobs_api.queue, "enqueue")
+    @patch.object(jobs_api.queue, "fetch_job")
+    @patch.object(jobs_api.redis_conn, "set")
+    @patch.object(jobs_api.redis_conn, "get", return_value=None)
+    @patch.object(jobs_api.redis_conn, "lock")
+    def test_recovers_job_when_idempotency_record_is_missing(
+        self, mock_lock, mock_get, mock_set, mock_fetch, mock_enqueue
+    ):
+        lock_context = MagicMock()
+        lock_context.__enter__.return_value = lock_context
+        lock_context.__exit__.return_value = False
+        mock_lock.return_value = lock_context
+
+        existing_job = MagicMock()
+        existing_job.id = "pathlens-existing-job"
+        existing_job.args = ("https://example.com", 5.0, 5)
+        existing_job.get_status.return_value = "queued"
+        mock_fetch.return_value = existing_job
+
+        response = self.client.post(
+            "/probes",
+            headers={"Idempotency-Key": "recovery-test"},
+            json={
+                "target": "https://example.com",
+                "timeout": 5,
+                "max_redirects": 5,
+            },
+        )
+
+        self.assertEqual(response.status_code, 202, response.text)
+        self.assertEqual(
+            response.json()["job_id"], "pathlens-existing-job"
+        )
+        self.assertTrue(response.json()["duplicate"])
+        mock_enqueue.assert_not_called()
+        mock_set.assert_called_once()
+
 if __name__ == "__main__":
     unittest.main()
